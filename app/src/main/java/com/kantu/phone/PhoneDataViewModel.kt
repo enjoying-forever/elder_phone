@@ -14,6 +14,8 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -41,14 +43,25 @@ data class CallEntry(
     val spokenLabel: String get() = name.ifBlank { number }
 }
 
-class PhoneDataViewModel(application: Application) : AndroidViewModel(application) {
+interface ContactDirectory {
+    val contacts: StateFlow<List<ContactEntry>>
+    val history: StateFlow<List<CallEntry>>
+    val loading: StateFlow<Boolean>
+    val error: StateFlow<String?>
+    fun permissionsChanged()
+}
+
+class PhoneDataViewModel(application: Application) : AndroidViewModel(application), ContactDirectory {
     private val resolver: ContentResolver = application.contentResolver
     private val _contacts = MutableStateFlow<List<ContactEntry>>(emptyList())
     private val _history = MutableStateFlow<List<CallEntry>>(emptyList())
     private val _loading = MutableStateFlow(false)
-    val contacts: StateFlow<List<ContactEntry>> = _contacts.asStateFlow()
-    val history: StateFlow<List<CallEntry>> = _history.asStateFlow()
-    val loading: StateFlow<Boolean> = _loading.asStateFlow()
+    override val contacts: StateFlow<List<ContactEntry>> = _contacts.asStateFlow()
+    override val history: StateFlow<List<CallEntry>> = _history.asStateFlow()
+    override val loading: StateFlow<Boolean> = _loading.asStateFlow()
+    private val _error = MutableStateFlow<String?>(null)
+    override val error = _error.asStateFlow()
+    private var refreshJob: Job? = null
 
     private var observing = false
     private val observer = object : ContentObserver(Handler(Looper.getMainLooper())) {
@@ -56,36 +69,65 @@ class PhoneDataViewModel(application: Application) : AndroidViewModel(applicatio
         override fun onChange(selfChange: Boolean, uri: Uri?) = refresh()
     }
 
-    fun permissionsChanged() {
-        if (hasDataPermissions() && !observing) {
-            resolver.registerContentObserver(ContactsContract.Contacts.CONTENT_URI, true, observer)
-            resolver.registerContentObserver(CallLog.Calls.CONTENT_URI, true, observer)
-            observing = true
+    override fun permissionsChanged() {
+        if (observing) {
+            resolver.unregisterContentObserver(observer)
+            observing = false
+        }
+        if (hasDataPermissions()) {
+            runCatching {
+                resolver.registerContentObserver(ContactsContract.Contacts.CONTENT_URI, true, observer)
+                observing = true
+            }
+            if (hasHistoryPermission()) runCatching {
+                resolver.registerContentObserver(CallLog.Calls.CONTENT_URI, true, observer)
+                observing = true
+            }
         }
         refresh()
     }
 
     fun refresh() {
+        refreshJob?.cancel()
         if (!hasDataPermissions()) {
             _contacts.value = emptyList()
             _history.value = emptyList()
+            _loading.value = false
             return
         }
-        viewModelScope.launch {
+        refreshJob = viewModelScope.launch {
             _loading.value = true
-            val loadedContacts = withContext(Dispatchers.IO) { queryContacts() }
-            val loadedHistory = withContext(Dispatchers.IO) { queryHistory(loadedContacts) }
-            _contacts.value = if (loadedContacts.isEmpty() && BuildConfig.DEBUG) demoContacts else loadedContacts
-            _history.value = if (loadedHistory.isEmpty() && BuildConfig.DEBUG) demoHistory else loadedHistory
-            _loading.value = false
+            _error.value = null
+            try {
+                val loadedContacts = withContext(Dispatchers.IO) { queryContacts() }
+                _contacts.value = loadedContacts
+                // Call history is optional: its denial/provider failure must never hide contacts.
+                _history.value = if (hasHistoryPermission()) {
+                    try {
+                        withContext(Dispatchers.IO) { queryHistory(loadedContacts) }
+                    } catch (cancelled: CancellationException) { throw cancelled }
+                    catch (_: Exception) { emptyList() }
+                } else emptyList()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                _contacts.value = emptyList()
+                _history.value = emptyList()
+                _error.value = "暂时读不到联系人，请家人检查通讯录权限"
+            } finally {
+                _loading.value = false
+            }
         }
     }
 
     private fun hasDataPermissions(): Boolean {
         val app = getApplication<Application>()
-        return ContextCompat.checkSelfPermission(app, Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED &&
-            ContextCompat.checkSelfPermission(app, Manifest.permission.READ_CALL_LOG) == PackageManager.PERMISSION_GRANTED
+        return ContextCompat.checkSelfPermission(app, Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED
     }
+
+    private fun hasHistoryPermission() = ContextCompat.checkSelfPermission(
+        getApplication<Application>(), Manifest.permission.READ_CALL_LOG,
+    ) == PackageManager.PERMISSION_GRANTED
 
     private fun queryContacts(): List<ContactEntry> {
         val entries = LinkedHashMap<String, ContactEntry>()
@@ -110,15 +152,14 @@ class PhoneDataViewModel(application: Application) : AndroidViewModel(applicatio
                 val number = cursor.getString(numberIndex).orEmpty()
                 if (number.isBlank()) continue
                 val key = normalize(number)
-                entries.putIfAbsent(
-                    key,
-                    ContactEntry(
+                if (!entries.containsKey(key)) {
+                    entries[key] = ContactEntry(
                         id = cursor.getLong(idIndex),
                         name = cursor.getString(nameIndex).orEmpty(),
                         number = number,
                         photoUri = cursor.getString(photoIndex),
-                    ),
-                )
+                    )
+                }
             }
         }
         return entries.values.toList()
@@ -133,6 +174,7 @@ class PhoneDataViewModel(application: Application) : AndroidViewModel(applicatio
             CallLog.Calls.DATE,
         )
         val result = mutableListOf<CallEntry>()
+        val seen = mutableSetOf<String>()
         resolver.query(
             CallLog.Calls.CONTENT_URI,
             projection,
@@ -144,8 +186,9 @@ class PhoneDataViewModel(application: Application) : AndroidViewModel(applicatio
             val nameIndex = cursor.getColumnIndexOrThrow(projection[1])
             val numberIndex = cursor.getColumnIndexOrThrow(projection[2])
             val dateIndex = cursor.getColumnIndexOrThrow(projection[3])
-            while (cursor.moveToNext()) {
+            while (result.size < 40 && cursor.moveToNext()) {
                 val number = cursor.getString(numberIndex).orEmpty()
+                if (number.isBlank() || number.startsWith("-") || !seen.add(normalize(number))) continue
                 val contact = byNumber[normalize(number)]
                 result += CallEntry(
                     id = cursor.getLong(idIndex),
@@ -159,22 +202,11 @@ class PhoneDataViewModel(application: Application) : AndroidViewModel(applicatio
         return result
     }
 
-    private fun normalize(number: String) = number.filter(Char::isDigit).takeLast(11)
+    private fun normalize(number: String) = PhonePolicy.contactKey(number)
 
     override fun onCleared() {
         if (observing) resolver.unregisterContentObserver(observer)
         super.onCleared()
     }
 
-    companion object {
-        private val demoContacts = listOf(
-            ContactEntry(-1, "女儿", "13800138001", isDemo = true),
-            ContactEntry(-2, "社区医生", "13800138002", isDemo = true),
-            ContactEntry(-3, "老朋友", "13800138003", isDemo = true),
-        )
-        private val demoHistory = listOf(
-            CallEntry(-1, "女儿", "13800138001", isDemo = true),
-            CallEntry(-2, "社区医生", "13800138002", isDemo = true),
-        )
-    }
 }

@@ -1,15 +1,11 @@
 package com.kantu.phone
 
 import android.Manifest
-import android.content.ActivityNotFoundException
 import android.content.Context
-import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Bundle
-import android.provider.Settings
-import android.telephony.TelephonyManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -19,6 +15,8 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -49,13 +47,15 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -68,6 +68,8 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalViewConfiguration
+import androidx.compose.ui.platform.ViewConfiguration
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
@@ -78,6 +80,10 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -86,8 +92,9 @@ import kotlinx.coroutines.withContext
 private val RequiredPermissions = arrayOf(
     Manifest.permission.CALL_PHONE,
     Manifest.permission.READ_CONTACTS,
-    Manifest.permission.READ_CALL_LOG,
 )
+
+internal val LocalCallGateway = staticCompositionLocalOf<CallGateway?> { null }
 
 private object KantuColors {
     val PageBg = Color(0xFFF6F3EC)
@@ -100,7 +107,6 @@ private object KantuColors {
     val Hairline = Color(0xFFE6E1D8)
     val FieldStroke = Color(0xFFD7D1C7)
     val TabTrack = Color(0xFFEFEBE3)
-    val Gear = Color(0xFFB5B0A6)
     val Banner = Color(0xFFFFE082)
 }
 
@@ -128,7 +134,7 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun KantuTheme(content: @Composable () -> Unit) {
+internal fun KantuTheme(content: @Composable () -> Unit) {
     MaterialTheme(
         colorScheme = androidx.compose.material3.lightColorScheme(
             primary = KantuColors.Primary,
@@ -146,12 +152,23 @@ private fun KantuTheme(content: @Composable () -> Unit) {
 
 @Composable
 private fun KantuApp(
-    speech: SpeechController,
+    speech: VoiceAnnouncer,
     data: PhoneDataViewModel = viewModel(),
 ) {
     val context = LocalContext.current
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
     var permissionsGranted by remember { mutableStateOf(hasAllPermissions(context)) }
     var permissionDenied by remember { mutableStateOf(false) }
+    DisposableEffect(lifecycle) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                permissionsGranted = hasAllPermissions(context)
+                data.permissionsChanged()
+            }
+        }
+        lifecycle.addObserver(observer)
+        onDispose { lifecycle.removeObserver(observer) }
+    }
     val chineseUnavailable by speech.chineseUnavailable.collectAsState()
     val launcher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
@@ -196,7 +213,7 @@ private fun KantuApp(
                         denied = permissionDenied,
                         onRequest = {
                             speech.speak("请求权限")
-                            launcher.launch(RequiredPermissions)
+                            launcher.launch(RequiredPermissions + Manifest.permission.READ_CALL_LOG)
                         },
                     )
                 }
@@ -274,10 +291,31 @@ private fun PermissionReason(symbol: String, title: String, explanation: String)
 }
 
 @Composable
-private fun PhoneHome(speech: SpeechController, data: PhoneDataViewModel) {
+internal fun PhoneHome(speech: VoiceAnnouncer, data: ContactDirectory) {
     var selectedTab by remember { mutableIntStateOf(0) }
     var showSettings by remember { mutableStateOf(false) }
     var largeError by remember { mutableStateOf<String?>(null) }
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    DisposableEffect(lifecycle) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP) {
+                speech.stop()
+                showSettings = false
+            }
+        }
+        lifecycle.addObserver(observer)
+        onDispose { lifecycle.removeObserver(observer); speech.stop() }
+    }
+    LaunchedEffect(showSettings) {
+        if (showSettings) {
+            delay(60_000)
+            showSettings = false
+            speech.speak("已关闭设置")
+        }
+    }
+    LaunchedEffect(Unit) {
+        speech.speak("点一下听名字，再点一下打电话。也可以直接输入号码。")
+    }
 
     LaunchedEffect(largeError) {
         if (largeError != null) {
@@ -291,6 +329,7 @@ private fun PhoneHome(speech: SpeechController, data: PhoneDataViewModel) {
             Header(
                 selectedTab = selectedTab,
                 onTab = { tab ->
+                    speech.stop()
                     selectedTab = tab
                     speech.speak(if (tab == 0) "拨号" else "通讯录")
                 },
@@ -344,11 +383,25 @@ private fun PhoneHome(speech: SpeechController, data: PhoneDataViewModel) {
 
 @Composable
 private fun Header(selectedTab: Int, onTab: (Int) -> Unit, onSettings: () -> Unit) {
+    val base = LocalViewConfiguration.current
+    val familyHold = remember(base) {
+        object : ViewConfiguration by base {
+            override val longPressTimeoutMillis = 3_000L
+        }
+    }
+    CompositionLocalProvider(LocalViewConfiguration provides familyHold) {
+        HeaderTabs(selectedTab, onTab, onSettings)
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun HeaderTabs(selectedTab: Int, onTab: (Int) -> Unit, onSettings: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .background(KantuColors.PageBg)
-            .padding(start = 12.dp, end = 6.dp, top = 10.dp, bottom = 8.dp),
+            .padding(horizontal = 12.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Row(
@@ -367,7 +420,11 @@ private fun Header(selectedTab: Int, onTab: (Int) -> Unit, onSettings: () -> Uni
                         .fillMaxHeight()
                         .clip(RoundedCornerShape(24.dp))
                         .background(if (selected) KantuColors.Primary else Color.Transparent)
-                        .clickable { onTab(index) },
+                        .combinedClickable(
+                            onClick = { onTab(index) },
+                            onLongClickLabel = "家人长按三秒调整播报音量",
+                            onLongClick = onSettings,
+                        ),
                     contentAlignment = Alignment.Center,
                 ) {
                     Text(
@@ -379,25 +436,17 @@ private fun Header(selectedTab: Int, onTab: (Int) -> Unit, onSettings: () -> Uni
                 }
             }
         }
-        Box(
-            modifier = Modifier
-                .size(48.dp)
-                .clickable(onClick = onSettings)
-                .semantics { contentDescription = "设置" },
-            contentAlignment = Alignment.Center,
-        ) {
-            Text("⚙", color = KantuColors.Gear, fontSize = 22.sp)
-        }
     }
 }
 
 @Composable
-private fun DialerPage(speech: SpeechController, data: PhoneDataViewModel, onError: (String) -> Unit) {
+private fun DialerPage(speech: VoiceAnnouncer, data: ContactDirectory, onError: (String) -> Unit) {
     val history by data.history.collectAsStateWithLifecycle()
     val loading by data.loading.collectAsStateWithLifecycle()
     var selectedId by remember { mutableStateOf<Long?>(null) }
     var number by remember { mutableStateOf("") }
     val context = LocalContext.current
+    val gateway = LocalCallGateway.current ?: remember(context) { SystemCallGateway(context) }
 
     LaunchedEffect(history, loading) {
         if (selectedId != null && history.none { it.id == selectedId }) selectedId = null
@@ -423,7 +472,8 @@ private fun DialerPage(speech: SpeechController, data: PhoneDataViewModel, onErr
                             demo = item.isDemo,
                             onClick = {
                                 if (selectedId == item.id) {
-                                    announceAndCall(context, speech, item.name, item.number, onError)
+                                    if (item.isDemo) speech.speak("这是演示联系人，不会拨号")
+                                    else announceAndCall(context, speech, item.name, item.number, onError, gateway)
                                 } else {
                                     selectedId = item.id
                                     speech.speak(announceName(item.name, item.number))
@@ -438,8 +488,10 @@ private fun DialerPage(speech: SpeechController, data: PhoneDataViewModel, onErr
             modifier = Modifier.fillMaxWidth().weight(1f),
             number = number,
             onDigit = { digit ->
-                speech.speak(digitToSpeech(digit))
-                number += digit
+                if (number.length < 20) {
+                    speech.speak(digitToSpeech(digit))
+                    number += digit
+                } else speech.speak("号码太长，请检查")
             },
             onClear = {
                 speech.speak("清除")
@@ -450,7 +502,7 @@ private fun DialerPage(speech: SpeechController, data: PhoneDataViewModel, onErr
                     speech.speak("请输入号码")
                     onError("请输入号码")
                 } else {
-                    announceAndCall(context, speech, "", number, onError)
+                    announceAndCall(context, speech, "", number, onError, gateway)
                 }
             },
         )
@@ -550,14 +602,15 @@ private fun KeyButton(
 }
 
 @Composable
-private fun ContactsPage(speech: SpeechController, data: PhoneDataViewModel, onError: (String) -> Unit) {
+private fun ContactsPage(speech: VoiceAnnouncer, data: ContactDirectory, onError: (String) -> Unit) {
     val contacts by data.contacts.collectAsStateWithLifecycle()
     val loading by data.loading.collectAsStateWithLifecycle()
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
-    var selectedId by remember { mutableStateOf<Long?>(null) }
-    val selectedIndex = contacts.indexOfFirst { it.id == selectedId }
+    val gateway = LocalCallGateway.current ?: remember(context) { SystemCallGateway(context) }
+    var selectedId by remember { mutableStateOf<String?>(null) }
+    val selectedIndex = contacts.indexOfFirst { "${it.id}:${it.number}" == selectedId }
     val selected = contacts.getOrNull(selectedIndex)
 
     LaunchedEffect(contacts, loading) {
@@ -572,7 +625,7 @@ private fun ContactsPage(speech: SpeechController, data: PhoneDataViewModel, onE
             return
         }
         val target = index.coerceIn(0, contacts.lastIndex)
-        selectedId = contacts[target].id
+        selectedId = "${contacts[target].id}:${contacts[target].number}"
         speech.speak(announceName(contacts[target].name, contacts[target].number))
         scope.launch { listState.animateScrollToItem(target) }
     }
@@ -588,19 +641,20 @@ private fun ContactsPage(speech: SpeechController, data: PhoneDataViewModel, onE
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
-                    items(contacts.size, key = { contacts[it].id }) { index ->
+                    items(contacts.size, key = { "${contacts[it].id}:${contacts[it].number}" }) { index ->
                         val item = contacts[index]
                         PersonRow(
                             name = item.name,
                             number = item.number,
                             photoUri = item.photoUri,
-                            selected = item.id == selectedId,
+                            selected = "${item.id}:${item.number}" == selectedId,
                             demo = item.isDemo,
                             onClick = {
-                                if (selectedId == item.id) {
-                                    announceAndCall(context, speech, item.name, item.number, onError)
+                                if (selectedId == "${item.id}:${item.number}") {
+                                    if (item.isDemo) speech.speak("这是演示联系人，不会拨号")
+                                    else announceAndCall(context, speech, item.name, item.number, onError, gateway)
                                 } else {
-                                    selectedId = item.id
+                                    selectedId = "${item.id}:${item.number}"
                                     speech.speak(announceName(item.name, item.number))
                                 }
                             },
@@ -622,7 +676,8 @@ private fun ContactsPage(speech: SpeechController, data: PhoneDataViewModel, onE
                 onClick = {
                     speech.speak("回到顶部")
                     if (contacts.isNotEmpty()) {
-                        selectedId = contacts.first().id
+                        selectedId = "${contacts.first().id}:${contacts.first().number}"
+                        speech.speak("回到顶部，${announceName(contacts.first().name, contacts.first().number)}")
                         scope.launch { listState.animateScrollToItem(0) }
                     } else {
                         speech.speak("通讯录为空")
@@ -678,7 +733,8 @@ private fun ContactsPage(speech: SpeechController, data: PhoneDataViewModel, onE
                         speech.speak("请先选择联系人")
                         onError("请先选择联系人")
                     } else {
-                        announceAndCall(context, speech, selected.name, selected.number, onError)
+                        if (selected.isDemo) speech.speak("这是演示联系人，不会拨号")
+                        else announceAndCall(context, speech, selected.name, selected.number, onError, gateway)
                     }
                 },
                 modifier = Modifier.weight(1f).fillMaxHeight(0.62f),
@@ -776,10 +832,18 @@ private fun PersonRow(
 @Composable
 private fun ContactPhoto(photoUri: String?, name: String, number: String) {
     val context = LocalContext.current
-    val bitmap by produceState<android.graphics.Bitmap?>(initialValue = null, photoUri) {
-        value = if (photoUri == null) null else withContext(Dispatchers.IO) {
+    var bitmap by remember(photoUri) { mutableStateOf<android.graphics.Bitmap?>(null) }
+    LaunchedEffect(photoUri) {
+        bitmap = if (photoUri == null) null else withContext(Dispatchers.IO) {
             runCatching {
-                context.contentResolver.openInputStream(Uri.parse(photoUri))?.use(BitmapFactory::decodeStream)
+                val uri = Uri.parse(photoUri)
+                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+                var sample = 1
+                while (bounds.outWidth / sample > 512 || bounds.outHeight / sample > 512) sample *= 2
+                context.contentResolver.openInputStream(uri)?.use {
+                    BitmapFactory.decodeStream(it, null, BitmapFactory.Options().apply { inSampleSize = sample })
+                }
             }.getOrNull()
         }
     }
@@ -814,7 +878,7 @@ private fun EmptyMessage(text: String) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun VolumeDialog(speech: SpeechController, onDismiss: () -> Unit) {
+private fun VolumeDialog(speech: VoiceAnnouncer, onDismiss: () -> Unit) {
     var volume by remember { mutableFloatStateOf(speech.volume * 100f) }
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -831,10 +895,15 @@ private fun VolumeDialog(speech: SpeechController, onDismiss: () -> Unit) {
                         volume = it
                         speech.setVolume((it / 100f).coerceIn(0f, 1f))
                     },
-                    onValueChangeFinished = { speech.speak("音量") },
-                    valueRange = 0f..100f,
+                    onValueChangeFinished = { speech.speak("这是平时的播报声音") },
+                    valueRange = 30f..100f,
                     modifier = Modifier.fillMaxWidth().height(64.dp),
                 )
+                Text("播报强度单独保存，不改系统音量。拨号前使用最大播报强度。实际响度仍受系统音量、静音和耳机影响。",
+                    fontSize = 17.sp, color = KantuColors.TextSecondary)
+                TextButton(onClick = { speech.speakForCall("这是拨号前的播报声音") }) {
+                    Text("试听拨号声音")
+                }
             }
         },
         confirmButton = {
@@ -874,49 +943,29 @@ private fun announceName(name: String, number: String): String {
 
 private fun announceAndCall(
     context: Context,
-    speech: SpeechController,
+    speech: VoiceAnnouncer,
     name: String,
     number: String,
     onError: (String) -> Unit,
+    gateway: CallGateway,
 ) {
+    val normalized = PhonePolicy.dialableNumber(number)
+    if (normalized == null) {
+        speech.speak("号码不正确，请检查")
+        onError("号码不正确，请检查")
+        return
+    }
     val who = announceName(name, number)
-    speech.speak("正在拨打$who") {
-        placeCall(context, number, speech, onError)
+    val place = {
+        if ((context as? LifecycleOwner)?.lifecycle?.currentState?.isAtLeast(Lifecycle.State.RESUMED) != false) {
+            gateway.call(normalized)?.let { message -> speech.speak(message); onError(message) }
+        }
+    }
+    if (speech.chineseUnavailable.value) {
+        speech.speak("正在拨打$who")
+        place()
+    } else {
+        speech.speakForCall("正在拨打$who", place)
     }
 }
 
-private fun placeCall(
-    context: Context,
-    number: String,
-    speech: SpeechController,
-    onError: (String) -> Unit,
-) {
-    if (ContextCompat.checkSelfPermission(context, Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED) {
-        speech.speak("没有权限")
-        onError("没有权限")
-        return
-    }
-    val airplaneMode = runCatching {
-        Settings.Global.getInt(context.contentResolver, Settings.Global.AIRPLANE_MODE_ON, 0) == 1
-    }.getOrDefault(false)
-    val telephony = context.getSystemService(Context.TELEPHONY_SERVICE) as? TelephonyManager
-    val cannotCall = airplaneMode || telephony?.phoneType == TelephonyManager.PHONE_TYPE_NONE ||
-        telephony?.simState == TelephonyManager.SIM_STATE_ABSENT
-    if (cannotCall) {
-        speech.speak("无法拨打")
-        onError("无法拨打")
-        return
-    }
-    try {
-        context.startActivity(Intent(Intent.ACTION_CALL, Uri.parse("tel:${Uri.encode(number)}")))
-    } catch (_: SecurityException) {
-        speech.speak("没有权限")
-        onError("没有权限")
-    } catch (_: ActivityNotFoundException) {
-        speech.speak("无法拨打")
-        onError("无法拨打")
-    } catch (_: Exception) {
-        speech.speak("无法拨打")
-        onError("无法拨打")
-    }
-}
