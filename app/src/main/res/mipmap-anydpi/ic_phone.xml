@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Legacy launchers: a self-contained vector with transparent outer padding. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="48dp" android:height="48dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <path android:fillColor="#245BC4"
+        android:pathData="M28,6 L80,6 Q102,6 102,28 L102,80 Q102,102 80,102 L28,102 Q6,102 6,80 L6,28 Q6,6 28,6 Z" />
+    <group android:pivotX="54" android:pivotY="54" android:scaleX="1.25" android:scaleY="1.25">
+        <path android:fillColor="#FFFFFF"
+            android:pathData="M35,30 C31,30 29,33 29,37 C30,57 48,75 68,77 C73,77 77,74 77,70 L77,64 Q77,62 74,61 L64,57 Q62,56 60,58 L55,63 C47,59 41,53 38,46 L43,41 Q45,39 44,37 L40,32 Q39,30 35,30 Z" />
+        <path android:fillColor="@android:color/transparent"
+            android:strokeColor="#FFFFFF" android:strokeWidth="4"
+            android:strokeLineCap="round"
+            android:pathData="M56,32 C67,32 76,41 76,52 M56,42 C61.5,42 66,46.5 66,52" />
+    </group>
+</vector>

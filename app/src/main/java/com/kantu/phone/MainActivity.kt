@@ -6,12 +6,21 @@ import android.content.pm.PackageManager
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+import android.view.HapticFeedbackConstants
+import android.view.MotionEvent
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -19,6 +28,7 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -36,12 +46,10 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -55,9 +63,11 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -68,10 +78,13 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.LocalViewConfiguration
 import androidx.compose.ui.platform.ViewConfiguration
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -96,26 +109,19 @@ private val RequiredPermissions = arrayOf(
 
 internal val LocalCallGateway = staticCompositionLocalOf<CallGateway?> { null }
 
-private object KantuColors {
-    val PageBg = Color(0xFFF6F3EC)
-    val Card = Color(0xFFFFFFFF)
-    val Primary = Color(0xFF1B8F5A)
-    val OnPrimary = Color.White
-    val TextPrimary = Color(0xFF1C1C1C)
-    val TextSecondary = Color(0xFF5C5C5C)
-    val Danger = Color(0xFFD94A3A)
-    val Hairline = Color(0xFFE6E1D8)
-    val FieldStroke = Color(0xFFD7D1C7)
-    val TabTrack = Color(0xFFEFEBE3)
-    val Banner = Color(0xFFFFE082)
-}
+/** Clock for the shaky-double-tap guard; tests provide the Compose test clock. */
+internal val LocalUptimeMillis = staticCompositionLocalOf<() -> Long> { SystemClock::uptimeMillis }
 
-private val CardShape = RoundedCornerShape(20.dp)
-private val KeyShape = RoundedCornerShape(20.dp)
-private val PillShape = RoundedCornerShape(28.dp)
+/**
+ * A second tap on the same row sooner than this after selecting it is treated as a
+ * trembling double-tap and ignored, so the elder always hears who they picked before calling.
+ */
+internal const val CONFIRM_TAP_MIN_GAP_MS = 700L
 
 class MainActivity : ComponentActivity() {
     private lateinit var speech: SpeechController
+    private val screenTimer = Handler(Looper.getMainLooper())
+    private val releaseScreen = Runnable { window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -127,27 +133,37 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        keepScreenAwake()
+    }
+
+    // Elders read and dial slowly; don't let a short system timeout lock the phone mid-number.
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        if (event.actionMasked == MotionEvent.ACTION_DOWN) keepScreenAwake()
+        return super.dispatchTouchEvent(event)
+    }
+
+    private fun keepScreenAwake() {
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        screenTimer.removeCallbacks(releaseScreen)
+        screenTimer.postDelayed(releaseScreen, SCREEN_AWAKE_MS)
+    }
+
+    override fun onPause() {
+        screenTimer.removeCallbacks(releaseScreen)
+        releaseScreen.run()
+        super.onPause()
+    }
+
     override fun onDestroy() {
         speech.shutdown()
         super.onDestroy()
     }
-}
 
-@Composable
-internal fun KantuTheme(content: @Composable () -> Unit) {
-    MaterialTheme(
-        colorScheme = androidx.compose.material3.lightColorScheme(
-            primary = KantuColors.Primary,
-            onPrimary = KantuColors.OnPrimary,
-            background = KantuColors.PageBg,
-            onBackground = KantuColors.TextPrimary,
-            surface = KantuColors.Card,
-            onSurface = KantuColors.TextPrimary,
-            error = KantuColors.Danger,
-            onError = Color.White,
-        ),
-        content = content,
-    )
+    private companion object {
+        const val SCREEN_AWAKE_MS = 2 * 60_000L
+    }
 }
 
 @Composable
@@ -253,12 +269,12 @@ private fun PermissionPage(denied: Boolean, onRequest: () -> Unit) {
         Button(
             onClick = onRequest,
             modifier = Modifier.fillMaxWidth().height(76.dp),
-            shape = RoundedCornerShape(20.dp),
+            shape = CardShape,
             colors = ButtonDefaults.buttonColors(
                 containerColor = KantuColors.Primary,
                 contentColor = KantuColors.OnPrimary,
             ),
-            elevation = ButtonDefaults.buttonElevation(defaultElevation = 3.dp, pressedElevation = 1.dp),
+            elevation = kantuButtonElevation(),
         ) {
             Text(if (denied) "重新授权" else "家人点这里授权", fontSize = 28.sp, fontWeight = FontWeight.Bold)
         }
@@ -270,7 +286,7 @@ private fun PermissionReason(symbol: String, title: String, explanation: String)
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .shadow(2.dp, CardShape)
+            .shadow(1.dp, CardShape)
             .clip(CardShape)
             .background(KantuColors.Card)
             .padding(horizontal = 16.dp, vertical = 14.dp),
@@ -293,6 +309,8 @@ private fun PermissionReason(symbol: String, title: String, explanation: String)
 @Composable
 internal fun PhoneHome(speech: VoiceAnnouncer, data: ContactDirectory) {
     var selectedTab by remember { mutableIntStateOf(0) }
+    var keypadVisible by rememberSaveable { mutableStateOf(false) }
+    var dialNumber by rememberSaveable { mutableStateOf("") }
     var showSettings by remember { mutableStateOf(false) }
     var largeError by remember { mutableStateOf<String?>(null) }
     val lifecycle = LocalLifecycleOwner.current.lifecycle
@@ -324,7 +342,7 @@ internal fun PhoneHome(speech: VoiceAnnouncer, data: ContactDirectory) {
         }
     }
 
-    Box(Modifier.fillMaxSize()) {
+    Box(Modifier.fillMaxSize().background(KantuColors.PageBg)) {
         Column(Modifier.fillMaxSize()) {
             Header(
                 selectedTab = selectedTab,
@@ -342,6 +360,10 @@ internal fun PhoneHome(speech: VoiceAnnouncer, data: ContactDirectory) {
                 DialerPage(
                     speech = speech,
                     data = data,
+                    keypadVisible = keypadVisible,
+                    onKeypadVisibility = { keypadVisible = it },
+                    number = dialNumber,
+                    onNumberChange = { dialNumber = it },
                     onError = { largeError = it },
                 )
             } else {
@@ -401,37 +423,42 @@ private fun HeaderTabs(selectedTab: Int, onTab: (Int) -> Unit, onSettings: () ->
         modifier = Modifier
             .fillMaxWidth()
             .background(KantuColors.PageBg)
-            .padding(horizontal = 12.dp, vertical = 10.dp),
+            .padding(horizontal = KantuSpacing.Page, vertical = KantuSpacing.Gap),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Row(
             modifier = Modifier
                 .weight(1f)
-                .height(56.dp)
+                .height(68.dp)
                 .clip(PillShape)
                 .background(KantuColors.TabTrack)
+                .border(1.dp, KantuColors.Hairline, PillShape)
                 .padding(4.dp),
         ) {
             listOf("拨号", "通讯录").forEachIndexed { index, title ->
                 val selected = selectedTab == index
+                val selectedColor = KantuColors.Primary
                 Box(
                     modifier = Modifier
                         .weight(1f)
                         .fillMaxHeight()
-                        .clip(RoundedCornerShape(24.dp))
-                        .background(if (selected) KantuColors.Primary else Color.Transparent)
+                        .clip(TabShape)
+                        .background(if (selected) selectedColor else Color.Transparent)
+                        .semantics {
+                            contentDescription = title
+                            this.selected = selected
+                        }
                         .combinedClickable(
-                            onClick = { onTab(index) },
+                            onClick = withHaptic { onTab(index) },
                             onLongClickLabel = "家人长按三秒调整播报音量",
                             onLongClick = onSettings,
                         ),
                     contentAlignment = Alignment.Center,
                 ) {
-                    Text(
-                        title,
+                    NavigationIcon(
+                        contacts = index == 1,
                         color = if (selected) KantuColors.OnPrimary else KantuColors.TextPrimary,
-                        fontSize = 28.sp,
-                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.size(44.dp),
                     )
                 }
             }
@@ -440,43 +467,73 @@ private fun HeaderTabs(selectedTab: Int, onTab: (Int) -> Unit, onSettings: () ->
 }
 
 @Composable
-private fun DialerPage(speech: VoiceAnnouncer, data: ContactDirectory, onError: (String) -> Unit) {
+private fun DialerPage(
+    speech: VoiceAnnouncer,
+    data: ContactDirectory,
+    keypadVisible: Boolean,
+    onKeypadVisibility: (Boolean) -> Unit,
+    number: String,
+    onNumberChange: (String) -> Unit,
+    onError: (String) -> Unit,
+) {
     val history by data.history.collectAsStateWithLifecycle()
     val loading by data.loading.collectAsStateWithLifecycle()
     var selectedId by remember { mutableStateOf<Long?>(null) }
-    var number by remember { mutableStateOf("") }
+    var selectedAt by remember { mutableLongStateOf(0L) }
+    val uptime = LocalUptimeMillis.current
     val context = LocalContext.current
     val gateway = LocalCallGateway.current ?: remember(context) { SystemCallGateway(context) }
-
-    LaunchedEffect(history, loading) {
-        if (selectedId != null && history.none { it.id == selectedId }) selectedId = null
-        if (!loading && history.isEmpty()) speech.speak("没有通话记录")
+    val searchKey = PhonePolicy.contactKey(number)
+    val visibleHistory = remember(history, searchKey) {
+        if (searchKey.isBlank()) history else history.filter {
+            PhonePolicy.contactKey(it.number).contains(searchKey)
+        }
     }
 
-    Column(Modifier.fillMaxSize()) {
-        Box(Modifier.fillMaxWidth().weight(1f)) {
+    LaunchedEffect(visibleHistory, loading) {
+        if (selectedId != null && visibleHistory.none { it.id == selectedId }) selectedId = null
+    }
+
+    Column(Modifier.fillMaxSize().navigationBarsPadding()) {
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .weight(if (keypadVisible) 0.43f else 1f),
+        ) {
             if (history.isEmpty()) {
                 EmptyMessage(if (loading) "正在读取" else "没有通话记录")
+            } else if (visibleHistory.isEmpty()) {
+                EmptyMessage("没有匹配的通话记录")
             } else {
                 LazyColumn(
                     modifier = Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                    contentPadding = PaddingValues(horizontal = KantuSpacing.Page, vertical = KantuSpacing.Gap),
+                    verticalArrangement = Arrangement.spacedBy(KantuSpacing.Gap),
                 ) {
-                    items(history, key = { it.id }) { item ->
-                        PersonRow(
+                    items(visibleHistory, key = { it.id }) { item ->
+                        CallHistoryRow(
                             name = item.name,
                             number = item.number,
                             photoUri = item.photoUri,
+                            date = item.date,
+                            kind = item.kind,
                             selected = selectedId == item.id,
                             demo = item.isDemo,
                             onClick = {
                                 if (selectedId == item.id) {
-                                    if (item.isDemo) speech.speak("这是演示联系人，不会拨号")
+                                    if (uptime() - selectedAt < CONFIRM_TAP_MIN_GAP_MS) Unit
+                                    else if (item.isDemo) speech.speak("这是演示联系人，不会拨号")
                                     else announceAndCall(context, speech, item.name, item.number, onError, gateway)
                                 } else {
                                     selectedId = item.id
-                                    speech.speak(announceName(item.name, item.number))
+                                    selectedAt = uptime()
+                                    speech.speak(
+                                        if (item.kind == CallKind.MISSED) {
+                                            "${describeCallTime(item.date)}，未接电话，${announceName(item.name, item.number)}"
+                                        } else {
+                                            announceName(item.name, item.number)
+                                        },
+                                    )
                                 }
                             },
                         )
@@ -484,26 +541,38 @@ private fun DialerPage(speech: VoiceAnnouncer, data: ContactDirectory, onError: 
                 }
             }
         }
-        Keypad(
-            modifier = Modifier.fillMaxWidth().weight(1f),
-            number = number,
-            onDigit = { digit ->
-                if (number.length < 20) {
-                    speech.speak(digitToSpeech(digit))
-                    number += digit
-                } else speech.speak("号码太长，请检查")
-            },
-            onClear = {
-                speech.speak("清除")
-                number = ""
-            },
-            onCall = {
-                if (number.isBlank()) {
-                    speech.speak("请输入号码")
-                    onError("请输入号码")
-                } else {
-                    announceAndCall(context, speech, "", number, onError, gateway)
-                }
+        if (keypadVisible) {
+            Keypad(
+                modifier = Modifier.fillMaxWidth().weight(0.57f),
+                number = number,
+                onNumberTap = {
+                    speech.speak(if (number.isBlank()) "请输入号码" else "号码是，${spokenNumber(number)}")
+                },
+                onDigit = { digit ->
+                    if (number.length < 20) {
+                        speech.speak(digitToSpeech(digit))
+                        onNumberChange(number + digit)
+                    } else speech.speak("号码太长，请检查")
+                },
+                onClear = {
+                    speech.speak("清除")
+                    onNumberChange("")
+                },
+                onCall = {
+                    if (number.isBlank()) {
+                        speech.speak("请输入号码")
+                        onError("请输入号码")
+                    } else {
+                        announceAndCall(context, speech, "", number, onError, gateway)
+                    }
+                },
+            )
+        }
+        KeypadToggle(
+            visible = keypadVisible,
+            onClick = {
+                onKeypadVisibility(!keypadVisible)
+                speech.speak(if (!keypadVisible) "已显示数字键盘" else "已隐藏数字键盘")
             },
         )
     }
@@ -513,30 +582,35 @@ private fun DialerPage(speech: VoiceAnnouncer, data: ContactDirectory, onError: 
 private fun Keypad(
     modifier: Modifier,
     number: String,
+    onNumberTap: () -> Unit,
     onDigit: (String) -> Unit,
     onClear: () -> Unit,
     onCall: () -> Unit,
 ) {
-    Column(modifier.padding(horizontal = 8.dp, vertical = 6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+    Column(
+        modifier.padding(horizontal = 8.dp, vertical = KantuSpacing.KeyGap),
+        verticalArrangement = Arrangement.spacedBy(KantuSpacing.KeyGap),
+    ) {
         Box(
             Modifier
                 .fillMaxWidth()
-                .weight(1.35f)
-                .shadow(3.dp, CardShape)
+                .weight(0.72f)
+                .shadow(1.dp, CardShape)
                 .clip(CardShape)
                 .background(KantuColors.Card)
-                .border(1.dp, KantuColors.FieldStroke, CardShape)
+                .border(1.dp, KantuColors.Hairline, CardShape)
+                .clickable(onClickLabel = "听号码", onClick = withHaptic(onNumberTap))
                 .padding(8.dp),
             contentAlignment = Alignment.Center,
         ) {
-            AutoSizeDialText(number)
+            DialNumberText(number)
         }
         listOf(listOf("1", "2", "3"), listOf("4", "5", "6"), listOf("7", "8", "9")).forEach { row ->
-            Row(Modifier.fillMaxWidth().weight(1f), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(Modifier.fillMaxWidth().weight(1f), horizontalArrangement = Arrangement.spacedBy(KantuSpacing.KeyGap)) {
                 row.forEach { digit -> KeyButton(digit, Modifier.weight(1f).fillMaxHeight()) { onDigit(digit) } }
             }
         }
-        Row(Modifier.fillMaxWidth().weight(1f), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        Row(Modifier.fillMaxWidth().weight(1f), horizontalArrangement = Arrangement.spacedBy(KantuSpacing.KeyGap)) {
             KeyButton(
                 label = "清除",
                 modifier = Modifier.weight(1f).fillMaxHeight(),
@@ -548,8 +622,8 @@ private fun Keypad(
             KeyButton(
                 label = "拨打",
                 modifier = Modifier.weight(1f).fillMaxHeight(),
-                container = KantuColors.Primary,
-                content = KantuColors.OnPrimary,
+                container = KantuColors.CallAction,
+                content = KantuColors.OnCallAction,
                 onClick = onCall,
             )
         }
@@ -557,28 +631,55 @@ private fun Keypad(
 }
 
 @Composable
-private fun AutoSizeDialText(number: String) {
+private fun KeypadToggle(visible: Boolean, onClick: () -> Unit) {
+    val label = if (visible) "隐藏拨号键盘" else "显示拨号键盘"
+    Button(
+        onClick = withHaptic(onClick),
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(60.dp)
+            .padding(start = KantuSpacing.Page, end = KantuSpacing.Page, bottom = KantuSpacing.Gap)
+            .semantics { contentDescription = label },
+        shape = CardShape,
+        border = BorderStroke(1.dp, KantuColors.Hairline),
+        colors = ButtonDefaults.buttonColors(
+            containerColor = KantuColors.Card,
+            contentColor = KantuColors.Primary,
+        ),
+        elevation = kantuButtonElevation(),
+        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+    ) {
+        KeypadToggleIcon(
+            expanded = visible,
+            color = KantuColors.Primary,
+            modifier = Modifier.size(34.dp),
+        )
+        Spacer(Modifier.width(12.dp))
+        Text(label, fontSize = 22.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+    }
+}
+
+@Composable
+private fun DialNumberText(number: String) {
     val placeholder = number.isBlank()
     val text = if (placeholder) "请输入号码" else number
-    val maxSp = if (placeholder) 40f else 56f
-    val minSp = 20f
-    var fontSp by remember(number) { mutableFloatStateOf(maxSp) }
-    Text(
+    val scroll = rememberScrollState()
+    LaunchedEffect(number, scroll.maxValue) {
+        scroll.scrollTo(if (placeholder) 0 else scroll.maxValue)
+    }
+    Box(Modifier.fillMaxWidth().horizontalScroll(scroll), contentAlignment = Alignment.Center) {
+      Text(
         text = text,
         color = if (placeholder) KantuColors.TextSecondary else KantuColors.TextPrimary,
-        fontSize = fontSp.sp,
+        fontSize = 32.sp,
+        lineHeight = 36.sp,
         fontWeight = FontWeight.Bold,
         maxLines = 1,
         softWrap = false,
         overflow = TextOverflow.Clip,
         textAlign = TextAlign.Center,
-        modifier = Modifier.fillMaxWidth(),
-        onTextLayout = { layout ->
-            if (layout.hasVisualOverflow && fontSp > minSp) {
-                fontSp = (fontSp - 2f).coerceAtLeast(minSp)
-            }
-        },
-    )
+      )
+    }
 }
 
 @Composable
@@ -590,14 +691,27 @@ private fun KeyButton(
     onClick: () -> Unit,
 ) {
     Button(
-        onClick = onClick,
+        onClick = withHaptic(onClick),
         modifier = modifier,
         shape = KeyShape,
+        border = if (container == KantuColors.Card) BorderStroke(1.dp, KantuColors.Hairline) else null,
         colors = ButtonDefaults.buttonColors(containerColor = container, contentColor = content),
         contentPadding = PaddingValues(2.dp),
-        elevation = ButtonDefaults.buttonElevation(defaultElevation = 3.dp, pressedElevation = 1.dp),
+        elevation = kantuButtonElevation(),
     ) {
-        Text(label, fontSize = if (label.length > 1) 28.sp else 52.sp, fontWeight = FontWeight.Bold, color = content)
+        BoxWithConstraints(contentAlignment = Alignment.Center) {
+            val scale = LocalDensity.current.fontScale
+            val font = minOf(
+                if (label.length > 1) 34f else 72f,
+                maxHeight.value / scale * 0.86f,
+                maxWidth.value / scale * if (label.length > 1) 0.42f else 0.8f,
+            ).coerceAtLeast(1f)
+            Text(
+                label, fontSize = font.sp, lineHeight = (font * 1.15f).sp,
+                fontWeight = FontWeight.Bold, color = content, maxLines = 1,
+                softWrap = false,
+            )
+        }
     }
 }
 
@@ -610,6 +724,8 @@ private fun ContactsPage(speech: VoiceAnnouncer, data: ContactDirectory, onError
     val context = LocalContext.current
     val gateway = LocalCallGateway.current ?: remember(context) { SystemCallGateway(context) }
     var selectedId by remember { mutableStateOf<String?>(null) }
+    var selectedAt by remember { mutableLongStateOf(0L) }
+    val uptime = LocalUptimeMillis.current
     val selectedIndex = contacts.indexOfFirst { "${it.id}:${it.number}" == selectedId }
     val selected = contacts.getOrNull(selectedIndex)
 
@@ -631,14 +747,14 @@ private fun ContactsPage(speech: VoiceAnnouncer, data: ContactDirectory, onError
     }
 
     Column(Modifier.fillMaxSize()) {
-        Box(Modifier.fillMaxWidth().weight(1f)) {
+        Box(Modifier.fillMaxWidth().weight(0.65f)) {
             if (contacts.isEmpty()) {
                 EmptyMessage(if (loading) "正在读取" else "通讯录为空")
             } else {
                 LazyColumn(
                     modifier = Modifier.fillMaxSize(),
                     state = listState,
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+                    contentPadding = PaddingValues(horizontal = KantuSpacing.Page, vertical = KantuSpacing.Gap),
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
                     items(contacts.size, key = { "${contacts[it].id}:${contacts[it].number}" }) { index ->
@@ -651,10 +767,12 @@ private fun ContactsPage(speech: VoiceAnnouncer, data: ContactDirectory, onError
                             demo = item.isDemo,
                             onClick = {
                                 if (selectedId == "${item.id}:${item.number}") {
-                                    if (item.isDemo) speech.speak("这是演示联系人，不会拨号")
+                                    if (uptime() - selectedAt < CONFIRM_TAP_MIN_GAP_MS) Unit
+                                    else if (item.isDemo) speech.speak("这是演示联系人，不会拨号")
                                     else announceAndCall(context, speech, item.name, item.number, onError, gateway)
                                 } else {
                                     selectedId = "${item.id}:${item.number}"
+                                    selectedAt = uptime()
                                     speech.speak(announceName(item.name, item.number))
                                 }
                             },
@@ -666,14 +784,14 @@ private fun ContactsPage(speech: VoiceAnnouncer, data: ContactDirectory, onError
         Row(
             Modifier
                 .fillMaxWidth()
-                .weight(1f)
-                .padding(start = 10.dp, end = 10.dp, top = 12.dp, bottom = 10.dp)
+                .weight(0.35f)
+                .padding(horizontal = KantuSpacing.Page, vertical = KantuSpacing.Gap)
                 .navigationBarsPadding(),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            horizontalArrangement = Arrangement.spacedBy(KantuSpacing.Gap),
         ) {
             Button(
-                onClick = {
+                onClick = withHaptic {
                     speech.speak("回到顶部")
                     if (contacts.isNotEmpty()) {
                         selectedId = "${contacts.first().id}:${contacts.first().number}"
@@ -686,15 +804,17 @@ private fun ContactsPage(speech: VoiceAnnouncer, data: ContactDirectory, onError
                 },
                 modifier = Modifier.weight(1f).fillMaxHeight(0.62f),
                 shape = CardShape,
+                border = BorderStroke(1.dp, KantuColors.Hairline),
                 colors = ButtonDefaults.buttonColors(
                     containerColor = KantuColors.Card,
                     contentColor = KantuColors.TextPrimary,
                 ),
-                elevation = ButtonDefaults.buttonElevation(defaultElevation = 3.dp, pressedElevation = 1.dp),
+                elevation = kantuButtonElevation(),
             ) {
                 Text(
                     "回到\n顶部",
                     fontSize = 25.sp,
+                    lineHeight = 32.sp,
                     fontWeight = FontWeight.Bold,
                     textAlign = TextAlign.Center,
                     color = KantuColors.TextPrimary,
@@ -705,7 +825,7 @@ private fun ContactsPage(speech: VoiceAnnouncer, data: ContactDirectory, onError
                 verticalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterVertically),
             ) {
                 Button(
-                    onClick = { moveTo(if (selectedIndex < 0) 0 else selectedIndex - 1) },
+                    onClick = withHaptic { moveTo(if (selectedIndex < 0) 0 else selectedIndex - 1) },
                     modifier = Modifier.fillMaxWidth().weight(1f),
                     shape = CardShape,
                     colors = ButtonDefaults.buttonColors(
@@ -713,10 +833,10 @@ private fun ContactsPage(speech: VoiceAnnouncer, data: ContactDirectory, onError
                         contentColor = KantuColors.OnPrimary,
                     ),
                     contentPadding = PaddingValues(8.dp),
-                    elevation = ButtonDefaults.buttonElevation(defaultElevation = 3.dp, pressedElevation = 1.dp),
+                    elevation = kantuButtonElevation(),
                 ) { DirectionArrow(up = true, Modifier.fillMaxHeight(0.72f).fillMaxWidth(0.55f)) }
                 Button(
-                    onClick = { moveTo(if (selectedIndex < 0) 0 else selectedIndex + 1) },
+                    onClick = withHaptic { moveTo(if (selectedIndex < 0) 0 else selectedIndex + 1) },
                     modifier = Modifier.fillMaxWidth().weight(1f),
                     shape = CardShape,
                     colors = ButtonDefaults.buttonColors(
@@ -724,11 +844,11 @@ private fun ContactsPage(speech: VoiceAnnouncer, data: ContactDirectory, onError
                         contentColor = KantuColors.OnPrimary,
                     ),
                     contentPadding = PaddingValues(8.dp),
-                    elevation = ButtonDefaults.buttonElevation(defaultElevation = 3.dp, pressedElevation = 1.dp),
+                    elevation = kantuButtonElevation(),
                 ) { DirectionArrow(up = false, Modifier.fillMaxHeight(0.72f).fillMaxWidth(0.55f)) }
             }
             Button(
-                onClick = {
+                onClick = withHaptic {
                     if (selected == null) {
                         speech.speak("请先选择联系人")
                         onError("请先选择联系人")
@@ -740,17 +860,18 @@ private fun ContactsPage(speech: VoiceAnnouncer, data: ContactDirectory, onError
                 modifier = Modifier.weight(1f).fillMaxHeight(0.62f),
                 shape = CardShape,
                 colors = ButtonDefaults.buttonColors(
-                    containerColor = KantuColors.Primary,
-                    contentColor = KantuColors.OnPrimary,
+                    containerColor = KantuColors.CallAction,
+                    contentColor = KantuColors.OnCallAction,
                 ),
-                elevation = ButtonDefaults.buttonElevation(defaultElevation = 3.dp, pressedElevation = 1.dp),
+                elevation = kantuButtonElevation(),
             ) {
                 Text(
                     "拨打\n电话",
                     fontSize = 25.sp,
+                    lineHeight = 32.sp,
                     fontWeight = FontWeight.Bold,
                     textAlign = TextAlign.Center,
-                    color = KantuColors.OnPrimary,
+                    color = KantuColors.OnCallAction,
                 )
             }
         }
@@ -787,6 +908,97 @@ private fun DirectionArrow(up: Boolean, modifier: Modifier = Modifier) {
 }
 
 @Composable
+private fun CallHistoryRow(
+    name: String,
+    number: String,
+    photoUri: String?,
+    date: Long,
+    kind: CallKind,
+    selected: Boolean,
+    demo: Boolean,
+    onClick: () -> Unit,
+) {
+    val primaryColor = if (selected) Color.White else KantuColors.TextPrimary
+    val secondaryColor = if (selected) Color.White else KantuColors.TextSecondary
+    val statusColor = when {
+        kind == CallKind.MISSED -> KantuColors.Missed
+        else -> secondaryColor
+    }
+    val timeText = formatCallDate(date)
+    val statusText = when (kind) {
+        CallKind.MISSED -> "未接电话"
+        CallKind.INCOMING -> "来电"
+        CallKind.OUTGOING -> "已拨电话"
+        CallKind.OTHER -> ""
+    }
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .shadow(1.dp, CardShape)
+            .clip(CardShape)
+            .background(if (selected) KantuColors.Primary else KantuColors.Card)
+            .border(1.dp, if (selected) KantuColors.Primary else KantuColors.Hairline, CardShape)
+            .clickable(onClick = withHaptic(onClick)),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            ContactPhoto(
+                photoUri = photoUri,
+                name = name,
+                number = number,
+                size = 60.dp,
+                background = KantuColors.Avatar,
+                foreground = KantuColors.Primary,
+            )
+            Spacer(Modifier.width(10.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    name.ifBlank { number },
+                    color = primaryColor,
+                    fontSize = 25.sp,
+                    lineHeight = 27.sp,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (name.isNotBlank()) {
+                    Text(
+                        number,
+                        color = secondaryColor,
+                        fontSize = 18.sp,
+                        lineHeight = 20.sp,
+                        maxLines = 1,
+                    )
+                }
+                Text(
+                    timeText,
+                    color = secondaryColor,
+                    fontSize = 17.sp,
+                    lineHeight = 20.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (statusText.isNotEmpty()) {
+                    Text(
+                        statusText,
+                        color = statusColor,
+                        modifier = if (kind == CallKind.MISSED && selected) {
+                            Modifier.background(KantuColors.Card, KeyShape).padding(horizontal = 4.dp)
+                        } else Modifier,
+                        fontSize = 17.sp,
+                        lineHeight = 20.sp,
+                        fontWeight = if (kind == CallKind.MISSED) FontWeight.Bold else FontWeight.Normal,
+                    )
+                }
+            }
+            if (demo) Text("演示", color = secondaryColor, fontSize = 16.sp)
+        }
+    }
+}
+
+@Composable
 private fun PersonRow(
     name: String,
     number: String,
@@ -800,18 +1012,18 @@ private fun PersonRow(
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .shadow(if (selected) 8.dp else 3.dp, CardShape)
+            .shadow(1.dp, CardShape)
             .clip(CardShape)
             .background(if (selected) KantuColors.Primary else KantuColors.Card)
-            .then(if (selected) Modifier.border(3.dp, Color.White, CardShape) else Modifier)
-            .clickable(onClick = onClick),
+            .border(1.dp, if (selected) KantuColors.Primary else KantuColors.Hairline, CardShape)
+            .clickable(onClick = withHaptic(onClick)),
     ) {
         Row(
-            modifier = Modifier.padding(start = 16.dp, end = 14.dp, top = 10.dp, bottom = 10.dp),
+            modifier = Modifier.padding(KantuSpacing.CardPadding),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             ContactPhoto(photoUri, name, number)
-            Spacer(Modifier.width(14.dp))
+            Spacer(Modifier.width(KantuSpacing.CardPadding))
             Column(Modifier.weight(1f)) {
                 Text(
                     name.ifBlank { number },
@@ -819,6 +1031,7 @@ private fun PersonRow(
                     fontSize = 27.sp,
                     fontWeight = FontWeight.Bold,
                     maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
                 )
                 if (name.isNotBlank()) {
                     Text(number, color = numberColor, fontSize = 19.sp, maxLines = 1)
@@ -830,7 +1043,14 @@ private fun PersonRow(
 }
 
 @Composable
-private fun ContactPhoto(photoUri: String?, name: String, number: String) {
+private fun ContactPhoto(
+    photoUri: String?,
+    name: String,
+    number: String,
+    size: androidx.compose.ui.unit.Dp = 72.dp,
+    background: Color = KantuColors.Avatar,
+    foreground: Color = KantuColors.Primary,
+) {
     val context = LocalContext.current
     var bitmap by remember(photoUri) { mutableStateOf<android.graphics.Bitmap?>(null) }
     LaunchedEffect(photoUri) {
@@ -852,13 +1072,18 @@ private fun ContactPhoto(photoUri: String?, name: String, number: String) {
         ?: number.trim().firstOrNull()?.toString()
         ?: "?"
     Box(
-        modifier = Modifier.size(72.dp).clip(CircleShape).background(KantuColors.Primary),
+        modifier = Modifier.size(size).clip(CircleShape).background(background),
         contentAlignment = Alignment.Center,
     ) {
         if (bitmap != null) {
             Image(bitmap!!.asImageBitmap(), contentDescription = "联系人照片", modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
         } else {
-            Text(initial, color = Color.White, fontSize = 34.sp, fontWeight = FontWeight.Bold)
+            Text(
+                initial,
+                color = foreground,
+                fontSize = if (size < 70.dp) 29.sp else 34.sp,
+                fontWeight = FontWeight.Bold,
+            )
         }
     }
 }
@@ -887,7 +1112,7 @@ private fun VolumeDialog(speech: VoiceAnnouncer, onDismiss: () -> Unit) {
             Text("播报音量", fontSize = 30.sp, fontWeight = FontWeight.Bold, color = KantuColors.TextPrimary)
         },
         text = {
-            Column {
+            Column(verticalArrangement = Arrangement.spacedBy(KantuSpacing.Gap)) {
                 Text("播报音量 ${volume.toInt()}", fontSize = 24.sp, color = KantuColors.TextSecondary)
                 Slider(
                     value = volume,
@@ -902,7 +1127,7 @@ private fun VolumeDialog(speech: VoiceAnnouncer, onDismiss: () -> Unit) {
                 Text("播报强度单独保存，不改系统音量。拨号前使用最大播报强度。实际响度仍受系统音量、静音和耳机影响。",
                     fontSize = 17.sp, color = KantuColors.TextSecondary)
                 TextButton(onClick = { speech.speakForCall("这是拨号前的播报声音") }) {
-                    Text("试听拨号声音")
+                    Text("试听拨号声音", fontSize = 20.sp, fontWeight = FontWeight.Bold)
                 }
             }
         },
@@ -911,35 +1136,28 @@ private fun VolumeDialog(speech: VoiceAnnouncer, onDismiss: () -> Unit) {
                 Text("关闭", fontSize = 24.sp, color = KantuColors.Primary, fontWeight = FontWeight.Bold)
             }
         },
-        shape = RoundedCornerShape(20.dp),
+        shape = CardShape,
     )
+}
+
+/** Adds a short key vibration to a tap, following the system touch-vibration setting. */
+@Composable
+private fun withHaptic(onClick: () -> Unit): () -> Unit {
+    val view = LocalView.current
+    return {
+        view.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+        onClick()
+    }
 }
 
 private fun hasAllPermissions(context: Context): Boolean = RequiredPermissions.all {
     ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
 }
 
-private val digitSpeech = mapOf(
-    '0' to "零",
-    '1' to "幺",
-    '2' to "二",
-    '3' to "三",
-    '4' to "四",
-    '5' to "五",
-    '6' to "六",
-    '7' to "七",
-    '8' to "八",
-    '9' to "九",
-)
+private fun digitToSpeech(digit: String): String = digit.map(::spokenDigit).joinToString("")
 
-private fun digitToSpeech(digit: String): String = digit.map { digitSpeech[it] ?: it.toString() }.joinToString("")
-
-private fun announceName(name: String, number: String): String {
-    val trimmed = name.trim()
-    if (trimmed.isNotEmpty()) return trimmed
-    val spokenNumber = number.filter(Char::isDigit).map { digitSpeech[it] ?: it.toString() }.joinToString(" ")
-    return spokenNumber.ifBlank { number }
-}
+private fun announceName(name: String, number: String): String =
+    name.trim().ifEmpty { spokenNumber(number) }
 
 private fun announceAndCall(
     context: Context,
@@ -968,4 +1186,3 @@ private fun announceAndCall(
         speech.speakForCall("正在拨打$who", place)
     }
 }
-
