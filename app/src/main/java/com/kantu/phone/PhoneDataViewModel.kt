@@ -32,12 +32,20 @@ data class ContactEntry(
     val spokenLabel: String get() = name.ifBlank { number }
 }
 
+enum class CallKind {
+    MISSED,
+    INCOMING,
+    OUTGOING,
+    OTHER,
+}
+
 data class CallEntry(
     val id: Long,
     val name: String,
     val number: String,
     val photoUri: String? = null,
     val date: Long = 0,
+    val kind: CallKind = CallKind.OTHER,
     val isDemo: Boolean = false,
 ) {
     val spokenLabel: String get() = name.ifBlank { number }
@@ -142,7 +150,9 @@ class PhoneDataViewModel(application: Application) : AndroidViewModel(applicatio
             projection,
             null,
             null,
-            "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} COLLATE LOCALIZED ASC",
+            // Family marks the people the elder calls most as 收藏 in the system contacts; list them first.
+            "${ContactsContract.CommonDataKinds.Phone.STARRED} DESC, " +
+                "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} COLLATE LOCALIZED ASC",
         )?.use { cursor ->
             val idIndex = cursor.getColumnIndexOrThrow(projection[0])
             val nameIndex = cursor.getColumnIndexOrThrow(projection[1])
@@ -172,6 +182,7 @@ class PhoneDataViewModel(application: Application) : AndroidViewModel(applicatio
             CallLog.Calls.CACHED_NAME,
             CallLog.Calls.NUMBER,
             CallLog.Calls.DATE,
+            CallLog.Calls.TYPE,
         )
         val result = mutableListOf<CallEntry>()
         val seen = mutableSetOf<String>()
@@ -186,6 +197,7 @@ class PhoneDataViewModel(application: Application) : AndroidViewModel(applicatio
             val nameIndex = cursor.getColumnIndexOrThrow(projection[1])
             val numberIndex = cursor.getColumnIndexOrThrow(projection[2])
             val dateIndex = cursor.getColumnIndexOrThrow(projection[3])
+            val typeIndex = cursor.getColumnIndexOrThrow(projection[4])
             while (result.size < 40 && cursor.moveToNext()) {
                 val number = cursor.getString(numberIndex).orEmpty()
                 if (number.isBlank() || number.startsWith("-") || !seen.add(normalize(number))) continue
@@ -196,6 +208,12 @@ class PhoneDataViewModel(application: Application) : AndroidViewModel(applicatio
                     number = number,
                     photoUri = contact?.photoUri,
                     date = cursor.getLong(dateIndex),
+                    kind = when (cursor.getInt(typeIndex)) {
+                        CallLog.Calls.MISSED_TYPE -> CallKind.MISSED
+                        CallLog.Calls.INCOMING_TYPE -> CallKind.INCOMING
+                        CallLog.Calls.OUTGOING_TYPE -> CallKind.OUTGOING
+                        else -> CallKind.OTHER
+                    },
                 )
             }
         }

@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <color name="ic_launcher_background">#16A34A</color>
+    <color name="kantu_primary">#245BC4</color>
+    <color name="kantu_background">#F1F5FA</color>
 </resources>
